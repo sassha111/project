@@ -14,11 +14,12 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.logger import configure
 from stable_baselines3.common.callbacks import BaseCallback
-from ta import trend, volatility
-from ta.momentum import RSIIndicator, StochasticOscillator, UltimateOscillator
-from ta.volume import OnBalanceVolumeIndicator, ChaikinMoneyFlowIndicator
-from ta.volatility import AverageTrueRange
-from ta.trend import IchimokuIndicator, PSARIndicator, CCIIndicator, TRIXIndicator, MACD
+# ✅ HFT: Технические индикаторы отключены для HFT (позиции 1-180 сек)
+# from ta import trend, volatility
+# from ta.momentum import RSIIndicator, StochasticOscillator, UltimateOscillator
+# from ta.volume import OnBalanceVolumeIndicator, ChaikinMoneyFlowIndicator
+# from ta.volatility import AverageTrueRange
+# from ta.trend import IchimokuIndicator, PSARIndicator, CCIIndicator, TRIXIndicator, MACD
 from dotenv import load_dotenv
 from collections import deque
 import signal
@@ -319,7 +320,7 @@ class TradingEnvironment(gym.Env):
         atr = self.data['atr'].iloc[self.current_step] if 'atr' in self.data.columns else (price * 0.001)
 
         # Адаптивный multiplier на основе spread (для HFT важнее spread чем волатильность)
-        spread = self.data.get('spread', atr * 0.5) if 'spread' in self.data.columns else atr * 0.5
+        spread = self.data['spread'].iloc[self.current_step] if 'spread' in self.data.columns else atr * 0.5
         volatility_factor = min(max(spread / price, 0.0005), 0.01)  # 0.05% - 1%
 
         if self.position == 'long':
