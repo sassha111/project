@@ -76,17 +76,136 @@ class ProgressCallback(BaseCallback):
             self.last_reported_progress = progress
         return True
 
+class AdaptiveRiskManager:
+    """
+    Адаптивное управление рисками на основе Kelly Criterion для HFT
+    Оптимизировано для краткосрочных позиций (1-180 сек)
+    """
+    def __init__(self, max_risk=0.02, min_risk=0.005):
+        """
+        Args:
+            max_risk: Максимальный риск на сделку (2% для HFT)
+            min_risk: Минимальный риск на сделку (0.5%)
+        """
+        self.max_risk = max_risk
+        self.min_risk = min_risk
+        self.trade_history = deque(maxlen=100)  # Последние 100 сделок
+
+    def calculate_position_size(self, balance, current_price, atr):
+        """
+        Расчет оптимального размера позиции на основе Half Kelly Criterion
+
+        Returns:
+            tuple: (amount, risk_fraction)
+        """
+        if len(self.trade_history) < 20:
+            # Консервативный подход до накопления статистики
+            kelly_fraction = self.min_risk
+            logging.debug(f"Kelly: Недостаточно истории ({len(self.trade_history)}/20), используем min_risk={self.min_risk:.2%}")
+        else:
+            # Рассчитываем Kelly Criterion
+            profits = [t['profit'] for t in self.trade_history]
+            winning_trades = [p for p in profits if p > 0]
+            losing_trades = [p for p in profits if p < 0]
+
+            if len(winning_trades) == 0 or len(losing_trades) == 0:
+                kelly_fraction = self.min_risk
+                logging.debug("Kelly: Нет winning или losing trades, используем min_risk")
+            else:
+                win_rate = len(winning_trades) / len(self.trade_history)
+                avg_win = np.mean(winning_trades)
+                avg_loss = abs(np.mean(losing_trades))
+
+                # Kelly formula: f = (bp - q) / b
+                # где b = avg_win/avg_loss, p = win_rate, q = 1 - win_rate
+                if avg_loss > 0:
+                    b = avg_win / avg_loss  # Win/Loss ratio
+                    kelly_fraction = (b * win_rate - (1 - win_rate)) / b
+                else:
+                    kelly_fraction = self.min_risk
+
+                # Half Kelly для консерватизма (снижение волатильности)
+                kelly_fraction = kelly_fraction * 0.5
+
+                # Ограничиваем риск в допустимом диапазоне
+                kelly_fraction = np.clip(kelly_fraction, self.min_risk, self.max_risk)
+
+                logging.debug(
+                    f"Kelly: win_rate={win_rate:.2%}, "
+                    f"avg_win={avg_win:.6f}, avg_loss={avg_loss:.6f}, "
+                    f"b={b:.2f}, kelly={kelly_fraction:.2%}"
+                )
+
+        # Дополнительная коррекция на волатильность рынка (важно для HFT)
+        volatility_factor = min(atr / current_price, 0.05)  # Макс 5% волатильность
+        # Снижаем риск при высокой волатильности
+        risk_adjusted_fraction = kelly_fraction * (1 - volatility_factor * 10)
+        risk_adjusted_fraction = max(risk_adjusted_fraction, self.min_risk)
+
+        # Финальный размер позиции
+        position_size = balance * risk_adjusted_fraction
+        amount = position_size / current_price
+
+        logging.info(
+            f"💰 Position sizing: balance={balance:.2f}, "
+            f"risk={risk_adjusted_fraction:.2%}, "
+            f"position_size={position_size:.2f}, amount={amount:.6f}"
+        )
+
+        return amount, risk_adjusted_fraction
+
+    def add_trade(self, profit, duration, win):
+        """Добавление сделки в историю для расчета Kelly"""
+        self.trade_history.append({
+            'profit': profit,
+            'duration': duration,
+            'win': win,
+            'timestamp': pd.Timestamp.now()
+        })
+
+    def get_statistics(self):
+        """Получение статистики по сделкам"""
+        if len(self.trade_history) == 0:
+            return {}
+
+        profits = [t['profit'] for t in self.trade_history]
+        winning_trades = [p for p in profits if p > 0]
+        losing_trades = [p for p in profits if p < 0]
+
+        return {
+            'total_trades': len(self.trade_history),
+            'winning_trades': len(winning_trades),
+            'losing_trades': len(losing_trades),
+            'win_rate': len(winning_trades) / len(self.trade_history) if self.trade_history else 0,
+            'avg_win': np.mean(winning_trades) if winning_trades else 0,
+            'avg_loss': np.mean(losing_trades) if losing_trades else 0,
+            'profit_factor': (
+                sum(winning_trades) / abs(sum(losing_trades))
+                if losing_trades else float('inf')
+            ),
+            'total_profit': sum(profits)
+        }
+
 class TradingEnvironment(gym.Env):
-    def __init__(self, data, norm_params=None, initial_balance=10, risk_percentage=0.01, short_term_threshold=10, long_term_threshold=50, history_size=100, window_size=20):
+    def __init__(self, data, norm_params=None, initial_balance=10, risk_percentage=0.01, short_term_threshold=10, long_term_threshold=50, history_size=100, window_size=20, max_position_duration=180):
         super(TradingEnvironment, self).__init__()
-        logging.debug("Initializing TradingEnvironment")
+        logging.debug("Initializing TradingEnvironment for HFT")
         self.timestamps = data['timestamp'].reset_index(drop=True)
         self.data = data.drop(columns=['timestamp']).reset_index(drop=True)
         self.initial_balance = initial_balance
-        self.risk_percentage = risk_percentage  # Changed to 1%
+        self.risk_percentage = risk_percentage  # Will be adaptive with Kelly
         self.short_term_threshold = short_term_threshold
         self.long_term_threshold = long_term_threshold
         self.window_size = window_size
+
+        # HFT-specific parameters
+        self.max_position_duration = max_position_duration  # Max 180 seconds for HFT
+        self.sl_multiplier = 1.5  # Tight SL for HFT (1.5x ATR)
+        self.tp_multiplier = 2.5  # TP for HFT (2.5x ATR, R:R = 1:1.67)
+
+        # ✅ Kelly Criterion Risk Manager для адаптивного sizing
+        self.risk_manager = AdaptiveRiskManager(max_risk=0.02, min_risk=0.005)
+
         if norm_params is None:
             self.means = self.data.mean()
             self.stds = self.data.std().replace(0, 1e-8)
@@ -189,6 +308,109 @@ class TradingEnvironment(gym.Env):
         logging.info("Обработка ошибки путем отката состояния")
         self.load_state(steps_back=2)
 
+    def _check_hft_stop_loss_take_profit(self, price):
+        """
+        Проверка SL/TP для HFT стратегии
+        Учитывает краткосрочность позиций (1-180 сек)
+        """
+        if self.position is None:
+            return False, 0
+
+        atr = self.data['atr'].iloc[self.current_step] if 'atr' in self.data.columns else (price * 0.001)
+
+        # Адаптивный multiplier на основе spread (для HFT важнее spread чем волатильность)
+        spread = self.data.get('spread', atr * 0.5) if 'spread' in self.data.columns else atr * 0.5
+        volatility_factor = min(max(spread / price, 0.0005), 0.01)  # 0.05% - 1%
+
+        if self.position == 'long':
+            # Tight SL для HFT: 1.5x ATR
+            stop_loss_price = self.entry_price - (self.sl_multiplier * atr)
+            # TP для HFT: 2.5x ATR (Risk/Reward = 1:1.67)
+            take_profit_price = self.entry_price + (self.tp_multiplier * atr)
+
+            if price <= stop_loss_price:
+                logging.info(f"⛔ HFT STOP LOSS triggered at {price:.8f} (entry: {self.entry_price:.8f})")
+                return True, -0.5  # Penalty за SL
+            elif price >= take_profit_price:
+                logging.info(f"✅ HFT TAKE PROFIT triggered at {price:.8f} (entry: {self.entry_price:.8f})")
+                return True, 0.3   # Bonus за TP
+
+        elif self.position == 'short':
+            stop_loss_price = self.entry_price + (self.sl_multiplier * atr)
+            take_profit_price = self.entry_price - (self.tp_multiplier * atr)
+
+            if price >= stop_loss_price:
+                logging.info(f"⛔ HFT STOP LOSS triggered at {price:.8f} (entry: {self.entry_price:.8f})")
+                return True, -0.5
+            elif price <= take_profit_price:
+                logging.info(f"✅ HFT TAKE PROFIT triggered at {price:.8f} (entry: {self.entry_price:.8f})")
+                return True, 0.3
+
+        return False, 0
+
+    def _check_max_position_duration(self):
+        """
+        Проверка максимального времени удержания позиции для HFT
+        Макс 180 секунд (3 минуты)
+        """
+        if self.position is None:
+            return False
+
+        duration = self.current_step - self.entry_step
+
+        # Force close если позиция держится слишком долго
+        if duration >= self.max_position_duration:
+            logging.warning(f"⏱️ HFT MAX DURATION reached: {duration} steps (max: {self.max_position_duration})")
+            return True
+
+        return False
+
+    def _calculate_hft_reward(self, profit, duration):
+        """
+        Продвинутая reward function для HFT
+        Фокус на краткосрочных прибыльных сделках
+        """
+        atr = self.data['atr'].iloc[self.current_step] if 'atr' in self.data.columns else 0.001
+
+        # 1. Базовая награда (risk-adjusted)
+        base_reward = profit / (atr + 1e-8)
+
+        # 2. Bonus за быстрые прибыльные сделки (HFT premium)
+        if profit > 0 and duration <= 60:  # < 1 minute
+            speed_bonus = 0.3 * (1 - duration / 60)  # Чем быстрее - тем больше bonus
+        else:
+            speed_bonus = 0
+
+        # 3. Penalty за долгие убыточные позиции
+        if profit < 0:
+            duration_penalty = -0.002 * duration
+        else:
+            duration_penalty = 0
+
+        # 4. Sharpe-like component (если есть история)
+        if len(self.balance_history) >= 20:
+            returns = np.diff(self.balance_history[-20:])
+            if len(returns) > 0 and returns.std() > 0:
+                sharpe = returns.mean() / (returns.std() + 1e-8)
+                sharpe_reward = sharpe * 0.2
+            else:
+                sharpe_reward = 0
+        else:
+            sharpe_reward = 0
+
+        # 5. Win rate component
+        if len(self.positions) >= 10:
+            recent_profits = [p.get('profit', 0) for p in self.positions[-10:]]
+            win_rate = sum(1 for p in recent_profits if p > 0) / len(recent_profits)
+            win_rate_bonus = (win_rate - 0.5) * 0.2
+        else:
+            win_rate_bonus = 0
+
+        # Total reward для HFT
+        total_reward = base_reward + speed_bonus + duration_penalty + sharpe_reward + win_rate_bonus
+
+        return total_reward
+
     def step(self, action):
         self.save_state()
         reward = 0
@@ -196,15 +418,29 @@ class TradingEnvironment(gym.Env):
         if self.current_step >= len(self.data):
             self.done = True
             profit = self.balance - self.previous_balance
-            volatility = self.data['atr'].iloc[self.current_step - 1]
-            reward = profit / (volatility + 1e-8)
-            logging.debug(f"Эпизод завершен. Прибыль: {profit}, Волатильность: {volatility}, Награда: {reward}")
+            duration = self.current_step - self.entry_step if self.position else 0
+            reward = self._calculate_hft_reward(profit, duration)
+            logging.debug(f"Эпизод завершен. Прибыль: {profit}, Награда: {reward}")
             return self._get_observation(), reward, self.done, False, info
+
         price = self.data['close'].iloc[self.current_step]
         timestamp = self.timestamps[self.current_step]
-        atr = self.data['atr'].iloc[self.current_step]
-        logging.debug(f"Текущий шаг: {self.current_step}, Цена: {price}, Время: {timestamp}, ATR: {atr}")
+        atr = self.data['atr'].iloc[self.current_step] if 'atr' in self.data.columns else (price * 0.001)
+        logging.debug(f"Текущий шаг: {self.current_step}, Цена: {price}, Время: {timestamp}")
 
+        # ✅ КРИТИЧНО: Проверка HFT SL/TP ПЕРЕД любыми действиями
+        should_close_sltp, sltp_reward = self._check_hft_stop_loss_take_profit(price)
+        if should_close_sltp:
+            reward += self._close_position(price, timestamp)
+            reward += sltp_reward
+
+        # ✅ КРИТИЧНО: Проверка максимального времени позиции (180 сек для HFT)
+        if self._check_max_position_duration():
+            logging.warning("Force closing position due to max duration")
+            reward += self._close_position(price, timestamp)
+            reward -= 0.3  # Penalty за force close
+
+        # Выполнение действий агента
         if action == 0:
             logging.debug("Действие: Удерживать позицию")
             pass
@@ -223,92 +459,111 @@ class TradingEnvironment(gym.Env):
                 logging.info("Действие: Открыть короткую позицию")
                 self._open_position('short', price, timestamp, atr)
 
-        # Удаляем логику тейк-профита и стоп-лосса
-
+        # ✅ Используем улучшенную HFT reward function
         profit = self.balance - self.previous_balance
-        volatility = self.data['atr'].iloc[self.current_step - 1]
-        reward += profit / (volatility + 1e-8)
-        if profit > 0:
-            reward += 0.1
-        elif profit < 0:
-            reward -= 0.1
-        reward += 0.01
-        logging.debug(f"Прибыль: {profit}, Волатильность: {volatility}, Награда: {reward}")
+        duration = self.current_step - self.entry_step if self.position else 0
+        reward += self._calculate_hft_reward(profit, duration)
+
+        logging.debug(f"Прибыль: {profit}, Duration: {duration}, Награда: {reward}")
         self.previous_balance = self.balance
         obs = self.normalized_data.iloc[self.current_step]
         self.obs_window.append(obs.values.astype(np.float32))
         self.current_step += 1
+
         if self.current_step >= len(self.data) - 1:
             self.done = True
             logging.debug("Достигнут конец данных")
+
         self.balance_history.append(self.balance)
+
         if self.detect_error():
             self.handle_error()
             reward -= 10
             self.done = False
+
         return self._get_observation(), reward, self.done, False, info
 
     def _open_position(self, position_type, price, timestamp, atr):
         self.position = position_type
         self.entry_price = price
         self.entry_step = self.current_step
-        self.position_size = self.balance * self.risk_percentage
-        self.units = self.position_size / price
-        # Удаляем переменные тейк-профита и стоп-лосса
-        # self.take_profit_multiplier = 2
-        # self.stop_loss_multiplier = 2
+
+        # ✅ Используем Kelly Criterion для адаптивного sizing
+        units, risk_fraction = self.risk_manager.calculate_position_size(
+            balance=self.balance,
+            current_price=price,
+            atr=atr
+        )
+
+        self.position_size = self.balance * risk_fraction
+        self.units = units
+
         self.positions.append({
             'entry_time': timestamp,
             'entry_price': price,
             'entry_step': self.current_step,
-            'atr': atr
+            'atr': atr,
+            'risk_fraction': risk_fraction  # Сохраняем для анализа
         })
-        logging.info(f"Позиция открыта: {position_type} по цене {price}")
+        logging.info(f"📊 Позиция открыта: {position_type} по цене {price:.8f}, размер: {self.units:.6f}, риск: {risk_fraction:.2%}")
 
     def _close_position(self, price, timestamp):
         if self.entry_price == 0:
             logging.warning("Попытка закрыть позицию без входной цены")
             return 0
+
         fee_rate = 0.001
         slippage = 0.001
         duration = self.current_step - self.entry_step
-        atr = self.data['atr'].iloc[self.entry_step]
+        atr = self.data['atr'].iloc[self.entry_step] if 'atr' in self.data.columns else (price * 0.001)
+
         if self.position == 'long':
             effective_price = price * (1 - slippage)
             profit = (effective_price - self.entry_price) * self.units
         else:
             effective_price = price * (1 + slippage)
             profit = (self.entry_price - effective_price) * self.units
+
         fee = self.position_size * fee_rate * 2
         profit -= fee
         self.balance += profit
         self.total_profit += profit
-        reward = profit / self.position_size
-        # Удаляем влияние тейк-профита и стоп-лосса на награду
-        # if self.position == 'long' and profit < 0:
-        #     reward -= 0.1
-        # if duration <= self.short_term_threshold and profit > 0:
-        #     reward += 0.05
-        # if profit > self.take_profit_multiplier * atr:
-        #     reward += 0.1
-        # elif profit < -self.stop_loss_multiplier * atr:
-        #     reward -= 0.1
-        # if duration <= self.short_term_threshold and profit > 0:
-        #     reward += 0.05
-        # if duration > self.long_term_threshold and profit < 0:
-        #     reward -= 0.05
+
+        # ✅ Добавляем сделку в risk_manager для Kelly Criterion
+        is_win = profit > 0
+        self.risk_manager.add_trade(profit=profit, duration=duration, win=is_win)
+
+        # Используем HFT reward function
+        reward = self._calculate_hft_reward(profit, duration)
+
         self.positions[-1].update({
             'exit_time': timestamp,
             'exit_price': price,
             'duration': duration,
             'profit': profit,
-            'atr': atr
+            'atr': atr,
+            'win': is_win
         })
-        logging.info(f"Позиция закрыта: {self.position} по цене {price}, Прибыль: {profit}")
+
+        profit_emoji = "✅" if profit > 0 else "❌"
+        logging.info(
+            f"{profit_emoji} Позиция закрыта: {self.position} по цене {price:.8f}, "
+            f"Прибыль: {profit:.6f}, Duration: {duration}s"
+        )
+
+        # Логируем статистику Kelly
+        stats = self.risk_manager.get_statistics()
+        if stats:
+            logging.info(
+                f"📈 Kelly Stats: WinRate={stats['win_rate']:.2%}, "
+                f"Trades={stats['total_trades']}, PF={stats['profit_factor']:.2f}"
+            )
+
         self.position = None
         self.entry_price = 0
         self.position_size = 0
         self.units = 0
+
         return reward
 
 def calculate_rvi(df, window=10):
@@ -721,14 +976,15 @@ def get_or_train_model_sync(symbol, train_df, models_dir, best_params=None, forc
         stds = env.stds.to_dict()
         env = DummyVecEnv([lambda: env])
         
-        # Faster training for initial model
+        # ✅ УЛУЧШЕНО: Увеличены timesteps для лучшего качества модели
         if force_train:
-            # Even faster for retraining
-            total_timesteps = 20000  # Quick retraining (~30-60 sec)
-            logging.info("Переобучение модели (20K шагов)")
+            # Качественное переобучение для HFT
+            total_timesteps = 100_000  # Было 20K → Теперь 100K (~2-3 мин)
+            logging.info("🔄 Переобучение HFT-модели (100K шагов, ~2-3 мин)")
         else:
-            total_timesteps = 50000  # Initial training (~1-2 min)
-            logging.info("Первичное обучение модели (50K шагов)")
+            # Глубокое начальное обучение для HFT
+            total_timesteps = 500_000  # Было 50K → Теперь 500K (~10-15 мин)
+            logging.info("🎯 Первичное обучение HFT-модели (500K шагов, ~10-15 мин)")
         callback = ProgressCallback(total_timesteps)
         
         if best_params:
@@ -1431,12 +1687,23 @@ async def train_models(symbols, historical_data, models, norm_params_dict, state
             symbol_model_dir = os.path.join(models_dir, symbol.replace("/", "_").replace(":", "_"))
             os.makedirs(symbol_model_dir, exist_ok=True)
             
-            # Train model with reduced trials for faster execution
-            study = optuna.create_study(direction='maximize', pruner=optuna.pruners.MedianPruner())
-            # Reduced trials for quick initial training
-            await run_optuna(study, train_df, test_df, n_trials=3)
+            # ✅ УЛУЧШЕНО: Качественная оптимизация гиперпараметров для HFT
+            study = optuna.create_study(
+                direction='maximize',
+                pruner=optuna.pruners.MedianPruner(
+                    n_startup_trials=10,  # Минимум trials перед pruning
+                    n_warmup_steps=5,      # Шагов перед оценкой
+                    interval_steps=3       # Интервал проверки
+                ),
+                sampler=optuna.samplers.TPESampler(
+                    n_startup_trials=10,
+                    multivariate=True
+                )
+            )
+            # ✅ Увеличено с 3 до 50 trials для качественной оптимизации
+            await run_optuna(study, train_df, test_df, n_trials=50)
             best_params = study.best_params
-            logging.info(f"Лучшие параметры оптимизации для {symbol}: {best_params}")
+            logging.info(f"🎯 Лучшие параметры оптимизации для {symbol}: {best_params}")
             
             model, norm_params = await loop.run_in_executor(executor, get_or_train_model_sync, symbol, train_df, symbol_model_dir, best_params)
             await loop.run_in_executor(executor, backtest_model_sync, model, test_df, symbol, norm_params)
