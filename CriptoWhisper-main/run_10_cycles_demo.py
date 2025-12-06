@@ -229,8 +229,6 @@ def backtest_with_model(model, test_data, norm_params, initial_balance=10000):
                 })
 
     # Calculate statistics
-    stats = env.risk_manager.get_statistics()
-
     final_balance = env.balance
     total_profit = final_balance - initial_balance
 
@@ -239,18 +237,31 @@ def backtest_with_model(model, test_data, norm_params, initial_balance=10000):
     min_after_max = min(balance_history[min_after_max_idx:]) if min_after_max_idx < len(balance_history) - 1 else max_balance
     max_dd = ((max_balance - min_after_max) / max_balance) if max_balance > 0 else 0
 
+    # Try to get stats from risk_manager if available, else use defaults
+    if hasattr(env, 'risk_manager'):
+        stats = env.risk_manager.get_statistics()
+        total_trades = stats['total_trades']
+        win_rate = stats['win_rate']
+        sharpe = stats.get('sharpe_ratio', 0)
+    else:
+        # Fallback: calculate from trades list
+        total_trades = len(trades)
+        winning_trades = len([t for t in trades if t['profit'] > 0])
+        win_rate = winning_trades / total_trades if total_trades > 0 else 0
+        sharpe = 0  # Cannot calculate without full history
+
     result = {
-        'trades': stats['total_trades'],
-        'winning_trades': int(stats['total_trades'] * stats['win_rate']),
-        'losing_trades': int(stats['total_trades'] * (1 - stats['win_rate'])),
+        'trades': total_trades,
+        'winning_trades': int(total_trades * win_rate),
+        'losing_trades': int(total_trades * (1 - win_rate)),
         'total_profit': total_profit,
-        'sharpe_ratio': stats.get('sharpe_ratio', 0),
+        'sharpe_ratio': sharpe,
         'max_drawdown': max_dd,
         'final_balance': final_balance,
-        'trades_per_second': stats['total_trades'] / len(test_data) if len(test_data) > 0 else 0
+        'trades_per_second': total_trades / len(test_data) if len(test_data) > 0 else 0
     }
 
-    logging.info(f"✅ Backtesting завершен | Сделок: {result['trades']} | Прибыль: ${total_profit:.2f} | Win Rate: {stats['win_rate']*100:.1f}%")
+    logging.info(f"✅ Backtesting завершен | Сделок: {result['trades']} | Прибыль: ${total_profit:.2f} | Win Rate: {win_rate*100:.1f}%")
 
     return result
 
