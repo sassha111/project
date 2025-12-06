@@ -222,7 +222,7 @@ def backtest_with_model(model, test_data, norm_params, initial_balance=10000):
         # Track trades from risk manager
         if hasattr(env, 'risk_manager'):
             stats = env.risk_manager.get_statistics()
-            if stats['total_trades'] > len(trades):
+            if stats and 'total_trades' in stats and stats['total_trades'] > len(trades):
                 trades.append({
                     'profit': env.balance - balance_history[-2] if len(balance_history) > 1 else 0,
                     'balance': env.balance
