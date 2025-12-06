@@ -2,9 +2,18 @@
 bybit_10_cycles.log
 *.log
 
+# Test output files
+full_test_*.txt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
 # Tensorboard logs
 ppo_tensorboard/PPO_*/
 
 # Model files (too large for git)
 models_demo/*/*.zip
 models_demo/*/*.json
+models_trading_full/
